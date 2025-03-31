@@ -1,108 +1,28 @@
-# TrueNAS SCALE Certificate Management with acme.sh
+## Important Note About Certificate Management in TrueNAS
 
-This guide explains how to automate SSL/TLS certificate management on TrueNAS SCALE Electric Eel (24.10.2) using acme.sh and DNS validation.
+### The midclt Limitation
 
-## Overview
+While using `midclt` to update certificates appears to work based on success messages, there is a known issue in TrueNAS SCALE where the certificate database may not properly update metadata (like issuance dates) even when the certificate content itself is updated. This leads to a discrepancy where:
 
-This solution allows you to:
+1. The actual certificate files used by the web UI and services are updated
+2. The certificate dates shown in the TrueNAS UI remain unchanged 
+3. The browser correctly shows the new certificate dates
 
-1. Obtain wildcard certificates via Let's Encrypt or ZeroSSL using DNS validation
-2. Automatically renew certificates before expiration
-3. Update TrueNAS web UI and services to use the renewed certificate
+### Direct File Update: A More Reliable Approach
 
-## Prerequisites
+After extensive testing, a more reliable method is to directly update the certificate files in the system and restart the web service. This approach bypasses the TrueNAS certificate database limitations.
 
-- TrueNAS SCALE Electric Eel (24.10.2) or later
-- Root shell access to your TrueNAS system
-- Domain name with DNS hosted at a supported provider (this guide uses GoDaddy)
-- API credentials for your DNS provider
+The improved script (below) features:
+- Direct file updates to `/etc/certificates/`
+- Certificate age checking to force renewal after a specified number of days
+- Proper certificate comparison to avoid unnecessary updates
+- Log rotation for better troubleshooting
 
-## Installation Steps
+While this method won't update the dates shown in the TrueNAS UI, it ensures that the actual certificates used by the system are properly updated and recognized by browsers.
 
-### 1. Install acme.sh
+### Optimized Certificate Update Script
 
-Access your TrueNAS shell as root and install acme.sh:
-
-```bash
-curl https://get.acme.sh | sh
-```
-
-This installs acme.sh to `/root/.acme.sh/` and adds a cron job for automatic renewals.
-
-### 2. Set up DNS API credentials
-
-Create an environment file for your DNS provider. For GoDaddy:
-
-```bash
-mkdir -p /mnt/tank/acme  # Adjust the pool name as needed
-cd /mnt/tank/acme
-cat > .godaddy.env << EOF
-export GD_Key="your_api_key"
-export GD_Secret="your_api_secret"
-EOF
-chmod 600 .godaddy.env
-```
-
-### 3. Issue your first certificate
-
-Run the following command to issue a wildcard certificate:
-
-```bash
-source ./.godaddy.env
-/root/.acme.sh/acme.sh --issue --dns dns_gd -d yourdomain.com -d "*.yourdomain.com"
-```
-
-This creates certificate files in `/root/.acme.sh/yourdomain.com_ecc/`.
-
-### 4. Create the update script
-
-Create a file named `update-cert.sh` in your persistence directory:
-
-```bash
-vi /mnt/tank/acme/update-cert.sh
-```
-
-Copy the script from the next section into this file, then make it executable:
-
-```bash
-chmod +x /mnt/tank/acme/update-cert.sh
-```
-
-### 5. Create initial certificate in TrueNAS UI
-
-1. Go to Credentials → Certificates
-2. Click "Add"
-3. Choose "Import Certificate"
-4. Enter a name (e.g., "letsencrypt")
-5. Import any temporary certificate (you can use the TrueNAS default)
-6. Save the certificate
-
-### 6. Run the update script
-
-Execute the script with the `--cp` flag to update the certificate in TrueNAS:
-
-```bash
-cd /mnt/tank/acme
-./update-cert.sh --cp
-```
-
-### 7. Set up automated renewal
-
-Edit the root crontab:
-
-```bash
-crontab -e
-```
-
-Add this line to run the script monthly:
-
-```
-0 0 1 * * /mnt/tank/acme/update-cert.sh > /mnt/tank/acme/renewal.log 2>&1
-```
-
-## The Certificate Update Script
-
-Save this as `update-cert.sh` and customize the variables at the top:
+The script below replaces the original script with the improved direct file approach:
 
 ```bash
 #!/usr/bin/env bash
@@ -111,6 +31,15 @@ set -euo pipefail
 ########################################
 # CONFIGURATION / PATHS
 ########################################
+
+# Script directory for logging
+SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+LOG_FILE="${SCRIPT_DIR}/acme-update.log"
+LOG_MAX_SIZE=1048576  # 1MB in bytes
+LOG_KEEP_FILES=3
+
+# Days threshold for renewal
+RENEWAL_DAYS_THRESHOLD=50
 
 GD_ENV="./.godaddy.env"
 CERT_DOMAIN="yourdomain.com"  # Change to your domain
@@ -123,8 +52,39 @@ PERSIST_BASE="/mnt/tank/acme/certs"  # Change to your pool/dataset
 PERSIST_CERT="${PERSIST_BASE}/${CERT_DOMAIN}-fullchain.cer"
 PERSIST_KEY="${PERSIST_BASE}/${CERT_DOMAIN}.key"
 
-# Certificate name in TrueNAS (must match name in UI)
-TRUENAS_CERT_NAME="letsencrypt"
+# System certificate locations
+SYS_CERT_PATH="/etc/certificates/letsencrypt.crt"
+SYS_KEY_PATH="/etc/certificates/letsencrypt.key"
+
+########################################
+# LOGGING SETUP
+########################################
+setup_logging() {
+    # Create log directory if it doesn't exist
+    mkdir -p "$(dirname "$LOG_FILE")"
+    
+    # Check if log file exceeds max size
+    if [ -f "$LOG_FILE" ]; then
+        LOG_SIZE=$(stat -c %s "$LOG_FILE" 2>/dev/null || stat -f %z "$LOG_FILE" 2>/dev/null)
+        if [ "$LOG_SIZE" -gt "$LOG_MAX_SIZE" ]; then
+            # Rotate logs
+            for i in $(seq $((LOG_KEEP_FILES-1)) -1 1); do
+                if [ -f "${LOG_FILE}.$i" ]; then
+                    mv "${LOG_FILE}.$i" "${LOG_FILE}.$((i+1))"
+                fi
+            done
+            mv "$LOG_FILE" "${LOG_FILE}.1"
+            touch "$LOG_FILE"
+        fi
+    else
+        touch "$LOG_FILE"
+    fi
+    
+    # Redirect stdout and stderr to both console and log file
+    exec > >(tee -a "$LOG_FILE") 2>&1
+    
+    echo "====== Certificate Update Script Started $(date) ======"
+}
 
 ########################################
 # CLI FLAGS: --force, --cp
@@ -151,94 +111,128 @@ for arg in "$@"; do
 done
 
 ########################################
+# SETUP LOGGING
+########################################
+setup_logging
+
+########################################
+# FUNCTION: CHECK CERTIFICATE AGE
+########################################
+check_cert_age() {
+    if [ ! -f "$CERT_PATH" ]; then
+        echo "Certificate file not found. Will force renewal."
+        FORCE=true
+        return 0
+    fi
+    
+    # Get certificate dates
+    local CERT_START_DATE=$(openssl x509 -in "$CERT_PATH" -noout -startdate 2>/dev/null | cut -d= -f2-)
+    local CERT_END_DATE=$(openssl x509 -in "$CERT_PATH" -noout -enddate 2>/dev/null | cut -d= -f2-)
+    
+    echo "Certificate start date: $CERT_START_DATE"
+    echo "Certificate end date: $CERT_END_DATE"
+    
+    # Get certificate file modification time
+    local CERT_MOD_TIME=$(stat -c %Y "$CERT_PATH" 2>/dev/null || stat -f %m "$CERT_PATH" 2>/dev/null)
+    local CURRENT_TIME=$(date +%s)
+    
+    # Calculate age in days
+    local CERT_AGE_SECONDS=$((CURRENT_TIME - CERT_MOD_TIME))
+    local CERT_AGE_DAYS=$((CERT_AGE_SECONDS / 86400))
+    
+    echo "Certificate file age: $CERT_AGE_DAYS days"
+    
+    if [ $CERT_AGE_DAYS -lt $RENEWAL_DAYS_THRESHOLD ]; then
+        echo "Certificate is only $CERT_AGE_DAYS days old (threshold: $RENEWAL_DAYS_THRESHOLD days)."
+        if [ "$FORCE" = "true" ]; then
+            echo "Force flag is set, will proceed with forced renewal anyway."
+            return 0
+        fi
+        echo "Skipping renewal process. Use --force to override."
+        return 1
+    fi
+    
+    echo "Certificate is $CERT_AGE_DAYS days old, which exceeds the threshold of $RENEWAL_DAYS_THRESHOLD days."
+    echo "Will force renewal automatically."
+    # Set the FORCE flag to true when certificate is older than threshold
+    FORCE=true
+    return 0
+}
+
+########################################
 # LOAD DNS ENV VARIABLES
 ########################################
 if [ "$COPY_ONLY" = false ]; then
   if [ -f "$GD_ENV" ]; then
     . "$GD_ENV"
   else
-    echo "ERROR: DNS provider env file not found at $GD_ENV" >&2
+    echo "ERROR: DNS provider env file not found at $GD_ENV"
     exit 1
   fi
 
   if [ -z "${GD_Key:-}" ] || [ -z "${GD_Secret:-}" ]; then
-    echo "ERROR: GD_Key or GD_Secret not set. Check $GD_ENV." >&2
+    echo "ERROR: GD_Key or GD_Secret not set. Check $GD_ENV."
     exit 1
   fi
 fi
 
 ########################################
-# FUNCTION: COPY & IMPORT TO TRUENAS
+# FUNCTION: COPY TO TRUENAS
 ########################################
-copy_and_import_to_truenas() {
-  # Ensure persistence directory exists and copy files there
-  mkdir -p "$PERSIST_BASE" || { echo "ERROR: mkdir failed" >&2; return 1; }
-  cp -f "$CERT_PATH" "$PERSIST_CERT" || { echo "ERROR: cp cert failed" >&2; return 1; }
-  cp -f "$KEY_PATH" "$PERSIST_KEY"   || { echo "ERROR: cp key failed" >&2; return 1; }
+copy_to_truenas() {
+  # Ensure persistence directory exists and copy files there.
+  mkdir -p "$PERSIST_BASE" || { echo "ERROR: mkdir failed"; return 1; }
+  
+  echo "Copying certificate from ACME to persistence location..."
+  cp -f "$CERT_PATH" "$PERSIST_CERT" || { echo "ERROR: cp cert failed"; return 1; }
+  
+  # Brief pause between file operations
+  sleep 1
+  
+  cp -f "$KEY_PATH" "$PERSIST_KEY" || { echo "ERROR: cp key failed"; return 1; }
 
+  # Verify copy
   if [ ! -f "$PERSIST_CERT" ] || [ ! -f "$PERSIST_KEY" ]; then
-      echo "ERROR: Persisted cert/key not found after copy." >&2
+      echo "ERROR: Persisted cert/key not found after copy."
       return 1
   fi
 
-  if ! command -v jq >/dev/null; then
-      echo "ERROR: jq command not found. Please install jq." >&2
-      return 1
-  fi
-
-  # Read the certificate and key files
-  CERT_CONTENT=$(cat "$PERSIST_CERT") || { echo "ERROR: Failed to read certificate file." >&2; return 1; }
-  KEY_CONTENT=$(cat "$PERSIST_KEY")   || { echo "ERROR: Failed to read key file." >&2; return 1; }
-
-  if [ -z "$CERT_CONTENT" ] || [ -z "$KEY_CONTENT" ]; then
-      echo "ERROR: Certificate or key content is empty." >&2
-      return 1
-  fi
-
-  # Find the existing certificate by name
-  echo "Looking for existing certificate with name '$TRUENAS_CERT_NAME'..."
-  EXISTING_CERT=$(midclt call certificate.query '[["name","=","'"$TRUENAS_CERT_NAME"'"]]' 2>&1)
-  EXISTING_CERT_ID=$(echo "$EXISTING_CERT" | jq -r '.[0].id // empty' 2>/dev/null)
+  # Brief pause before system file updates
+  sleep 2
   
-  if [ -z "$EXISTING_CERT_ID" ]; then
-      echo "ERROR: Certificate with name '$TRUENAS_CERT_NAME' not found in TrueNAS." >&2
-      echo "Please create a certificate with name '$TRUENAS_CERT_NAME' in the TrueNAS web interface first." >&2
-      echo "Available certificates:"
-      midclt call certificate.query | jq -r '.[] | "ID: \(.id), Name: \(.name)"'
-      return 1
-  fi
+  # DIRECT FILE UPDATE - Copy certificates directly to system locations
+  echo "Directly updating system certificate files..."
+  cp -f "$PERSIST_CERT" "$SYS_CERT_PATH" || { echo "ERROR: cp to system cert path failed"; return 1; }
   
-  echo "Found certificate with ID: $EXISTING_CERT_ID"
+  # Brief pause between copying cert and key
+  sleep 1
   
-  # Update the existing certificate
-  echo "Updating existing certificate..."
-  JSON_DATA=$(jq -n --arg cert "$CERT_CONTENT" --arg key "$KEY_CONTENT" '{
-    "certificate": $cert,
-    "privatekey": $key
-  }') || { echo "ERROR: Failed to create JSON payload." >&2; return 1; }
+  cp -f "$PERSIST_KEY" "$SYS_KEY_PATH" || { echo "ERROR: cp to system key path failed"; return 1; }
+  echo "System certificate files updated successfully."
   
-  UPDATE_OUTPUT=$(midclt call certificate.update "$EXISTING_CERT_ID" "$JSON_DATA" 2>&1)
-  UPDATE_STATUS=$?
+  # Allow filesystem to settle
+  sync
+  sleep 3
   
-  if [ $UPDATE_STATUS -ne 0 ]; then
-      echo "ERROR: Failed to update certificate: $UPDATE_OUTPUT" >&2
-      return 1
-  fi
-  
-  echo "Certificate updated successfully."
-  
-  # Update the UI certificate
-  echo "Setting certificate as the UI certificate..."
-  UPDATE_OUTPUT=$(midclt call system.general.update "{\"ui_certificate\":$EXISTING_CERT_ID}" 2>&1)
-  UPDATE_EXIT_STATUS=$?
-  
-  if [ $UPDATE_EXIT_STATUS -ne 0 ]; then
-      echo "WARNING: Failed to set the certificate as the UI certificate: $UPDATE_OUTPUT" >&2
-      echo "You may need to manually set this certificate as the UI certificate in the TrueNAS web interface."
+  # Restart the web service
+  echo "Restarting web service..."
+  midclt call service.restart "http" >/dev/null 2>&1
+  RESTART_STATUS=$?
+  if [ $RESTART_STATUS -ne 0 ]; then
+      echo "WARNING: Failed to restart web service (exit code: $RESTART_STATUS)."
+      echo "You may need to manually restart the web service from the TrueNAS UI."
   else
-      echo "UI certificate updated successfully."
+      echo "Web service restarted successfully."
   fi
   
+  # Allow web service to fully restart
+  sleep 5
+  
+  # Verify certificate dates
+  echo "Verifying certificate dates:"
+  echo "System certificate file date:" 
+  openssl x509 -in "$SYS_CERT_PATH" -noout -dates
+
   return 0
 }
 
@@ -248,11 +242,20 @@ copy_and_import_to_truenas() {
 if [ "$COPY_ONLY" = true ]; then
   echo "Running in COPY-ONLY mode."
   if [ ! -f "$CERT_PATH" ] || [ ! -f "$KEY_PATH" ]; then
-    echo "ERROR: Source certificate or key file not found." >&2
+    echo "ERROR: Source certificate or key file not found."
     exit 1
   fi
-  copy_and_import_to_truenas || { echo "ERROR: Import failed." >&2; exit 1; }
+  copy_to_truenas || { echo "ERROR: Copy failed."; exit 1; }
   exit 0
+fi
+
+########################################
+# CHECK CERTIFICATE AGE BEFORE RENEWAL
+########################################
+if ! check_cert_age; then
+    echo "Certificate renewal skipped based on age check."
+    echo "====== Certificate Update Script Finished $(date) ======"
+    exit 0
 fi
 
 ########################################
@@ -264,137 +267,73 @@ ACME_EXIT_STATUS=0
 if [ "$FORCE" = true ]; then
   echo "Forcing a new certificate from Let's Encrypt..."
   if ! $ACME_COMMAND --issue --force -d "$CERT_DOMAIN" -d "*.$CERT_DOMAIN"; then
-      echo "ERROR: acme.sh --issue --force encountered an error." >&2
+      echo "ERROR: acme.sh --issue --force encountered an error."
       exit 1
   fi
+  
+  # Allow time for file operations to complete
+  sleep 3
+  
 else
   echo "Attempting a normal renewal..."
   $ACME_COMMAND --renew -d "$CERT_DOMAIN" -d "*.$CERT_DOMAIN" || ACME_EXIT_STATUS=$?
   if [ $ACME_EXIT_STATUS -ne 0 ] && [ $ACME_EXIT_STATUS -ne 2 ]; then
-      echo "WARNING: acme.sh --renew exited with status $ACME_EXIT_STATUS." >&2
+      echo "WARNING: acme.sh --renew exited with status $ACME_EXIT_STATUS."
   fi
+  
+  # Allow time for file operations to complete
+  sleep 2
 fi
 
 if [ ! -f "$CERT_PATH" ] || [ ! -f "$KEY_PATH" ]; then
-  echo "ERROR: Certificate or key file not found after acme.sh run." >&2
+  echo "ERROR: Certificate or key file not found after acme.sh run."
   exit 1
 fi
 
-MODIFICATION_THRESHOLD_SECONDS=$((60 * 60 * 24))
-CURRENT_TIME=$(date +%s)
-CERT_MTIME=$(stat -c %Y "$CERT_PATH" 2>/dev/null || date -r "$CERT_PATH" +%s 2>/dev/null || echo 0)
-TIME_DIFF=$((CURRENT_TIME - CERT_MTIME))
-
+# Compare ACME certificate with system certificate
+# Only update if they differ or if forced
 SHOULD_IMPORT=false
-if [ $ACME_EXIT_STATUS -eq 0 ]; then
-    echo "acme.sh completed successfully."
-    SHOULD_IMPORT=true
-elif [ $TIME_DIFF -lt $MODIFICATION_THRESHOLD_SECONDS ]; then
-    echo "Certificate file appears recently modified."
-    SHOULD_IMPORT=true
-fi
 
-if [ "$SHOULD_IMPORT" = true ]; then
-  echo "Proceeding with import into TrueNAS..."
-  copy_and_import_to_truenas || { echo "ERROR: Import failed." >&2; exit 1; }
+if [ $ACME_EXIT_STATUS -eq 0 ]; then
+  echo "acme.sh completed successfully with a new certificate."
+  SHOULD_IMPORT=true
+elif [ "$FORCE" = true ]; then
+  echo "Force flag used - will update certificate."
+  SHOULD_IMPORT=true
 else
-  if [ "$FORCE" = true ]; then
-    echo "WARNING: --force was used, but certificate file does not seem updated." >&2
+  # Check if system cert exists
+  if [ ! -f "$SYS_CERT_PATH" ]; then
+    echo "System certificate does not exist. Will copy the certificate."
+    SHOULD_IMPORT=true
   else
-    echo "No new certificate issued. Skipping import."
+    # Compare certificates
+    echo "Comparing certificates..."
+    ACME_FINGERPRINT=$(openssl x509 -in "$CERT_PATH" -noout -fingerprint -sha256 2>/dev/null)
+    # Brief pause between operations
+    sleep 1
+    SYS_FINGERPRINT=$(openssl x509 -in "$SYS_CERT_PATH" -noout -fingerprint -sha256 2>/dev/null)
+    
+    if [ "$ACME_FINGERPRINT" != "$SYS_FINGERPRINT" ]; then
+      echo "Certificates are different. Will update system certificate."
+      echo "ACME fingerprint: $ACME_FINGERPRINT"
+      echo "System fingerprint: $SYS_FINGERPRINT"
+      SHOULD_IMPORT=true
+    else
+      echo "Certificates are identical. No update needed."
+      SHOULD_IMPORT=false
+    fi
   fi
 fi
 
-echo "Script finished."
+# Brief pause before proceeding
+sleep 2
+
+if [ "$SHOULD_IMPORT" = true ]; then
+  echo "Proceeding with copy to TrueNAS..."
+  copy_to_truenas || { echo "ERROR: Copy failed."; exit 1; }
+else
+  echo "No certificate update needed."
+fi
+
+echo "====== Certificate Update Script Finished $(date) ======"
 exit 0
-```
-
-## Understanding the midclt Command
-
-The `midclt` command is TrueNAS SCALE's middleware client tool for interacting with the backend API. Here's how to use it effectively in scripts:
-
-### Basic Syntax
-
-```bash
-midclt call <namespace>.<method> [arguments]
-```
-
-### Common Certificate Operations
-
-1. **List all certificates**:
-   ```bash
-   midclt call certificate.query
-   ```
-
-2. **Get a specific certificate by name**:
-   ```bash
-   midclt call certificate.query '[["name","=","letsencrypt"]]'
-   ```
-
-3. **Update a certificate**:
-   ```bash
-   midclt call certificate.update <id> '{"certificate":"<cert-content>","privatekey":"<key-content>"}'
-   ```
-
-4. **Set a certificate as the UI certificate**:
-   ```bash
-   midclt call system.general.update '{"ui_certificate":<cert-id>}'
-   ```
-
-### Tips for Using midclt in Scripts
-
-1. **Always capture output and exit status**:
-   ```bash
-   OUTPUT=$(midclt call some.command 2>&1)
-   STATUS=$?
-   if [ $STATUS -ne 0 ]; then
-       echo "Error: $OUTPUT" >&2
-   fi
-   ```
-
-2. **Use jq to parse JSON responses**:
-   ```bash
-   CERT_ID=$(midclt call certificate.query '[["name","=","letsencrypt"]]' | jq -r '.[0].id // empty')
-   ```
-
-3. **Handle errors gracefully**:
-   ```bash
-   if [ -z "$CERT_ID" ]; then
-       echo "Certificate not found" >&2
-       # Provide fallback behavior
-   fi
-   ```
-
-4. **Testing midclt commands**:
-   You can test commands directly in the shell before adding them to scripts.
-
-## Troubleshooting
-
-### Certificate Not Found
-
-If the script can't find your certificate:
-```
-ERROR: Certificate with name 'letsencrypt' not found in TrueNAS.
-```
-
-Make sure you've created a certificate with the exact name specified in `TRUENAS_CERT_NAME` in the TrueNAS UI.
-
-### acme.sh Errors
-
-If acme.sh reports rate limiting:
-```
-The retryafter=86400 value is too large (> 600), will not retry anymore.
-```
-
-This is normal if you've recently requested a certificate. Use `--cp` to update without renewal.
-
-### UI Certificate Update Failure
-
-If setting the UI certificate fails, you can manually set it in the TrueNAS UI:
-1. Go to System Settings → General
-2. Select your certificate in the "GUI SSL Certificate" dropdown
-3. Save changes
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
